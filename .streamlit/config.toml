@@ -1,0 +1,6 @@
+# Skip the "Welcome to Streamlit" email prompt so the app starts immediately
+[server]
+prompt = false
+
+[browser]
+gatherUsageStats = false

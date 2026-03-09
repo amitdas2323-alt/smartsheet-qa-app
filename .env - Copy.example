@@ -1,0 +1,7 @@
+# Smartsheet (required for summary and prompt)
+SMARTSHEET_ACCESS_TOKEN=your_smartsheet_api_token
+SMARTSHEET_SHEET_ID=your_sheet_id
+
+# Optional: for natural-language answers when using "prompt"
+OPENAI_API_KEY=your_openai_api_key
+# OPENAI_MODEL=gpt-4o-mini
