@@ -224,6 +224,35 @@ def _keyword_search(column_names: list[str], rows: list[dict[str, Any]], questio
     return "\n".join(lines)
 
 
+def _columns_relevant_to_question(column_names: list[str], question: str) -> list[str]:
+    """
+    Return columns whose names are suggested by the question (e.g. 'who is divisional president'
+    -> prefer column 'Divisional President'). Lets the table show the field that answers the question.
+    """
+    q = question.lower().strip()
+    words = [w for w in re.split(r"[\s,?]+", q) if len(w) > 1]
+    phrases = []
+    for i in range(len(words)):
+        for j in range(i + 1, min(i + 4, len(words) + 1)):
+            phrases.append(" ".join(words[i:j]))
+    phrases = [p for p in phrases if len(p) > 2]
+    relevant = []
+    for col in column_names:
+        col_lower = col.lower()
+        for p in phrases:
+            if p in col_lower:
+                if col not in relevant:
+                    relevant.append(col)
+                break
+        else:
+            for w in words:
+                if len(w) > 2 and w in col_lower:
+                    if col not in relevant:
+                        relevant.append(col)
+                    break
+    return relevant
+
+
 def _keyword_search_structured(
     column_names: list[str], rows: list[dict[str, Any]], question: str
 ) -> dict[str, Any]:
@@ -232,17 +261,26 @@ def _keyword_search_structured(
     if not matches:
         return {"type": "text", "content": "No matching rows found. Try different terms or check the summary."}
 
-    # Build display columns: include go-live columns when relevant
+    # Question-relevant columns first (e.g. "Divisional President" for "who is divisional president"),
+    # then key cols, go-live when relevant, then rest. Cap at 15 so any field can be shown.
     key_cols = [c for c in column_names if c in ("Account Name", "Unique Product Acct ID", "Baseline: Overall Status", "Vertical", "Lead Region", "Deployment Type")][:6]
+    question_cols = _columns_relevant_to_question(column_names, question)
     go_live_cols = [c for c in column_names if "go live" in c.lower() or "target go live" in c.lower()]
+    display_cols = []
+    for c in question_cols:
+        if c not in display_cols:
+            display_cols.append(c)
+    for c in key_cols:
+        if c not in display_cols:
+            display_cols.append(c)
     if display_go_live and go_live_cols:
-        display_cols = [c for c in key_cols if c in column_names]
         for c in go_live_cols:
             if c not in display_cols:
                 display_cols.append(c)
-        display_cols = display_cols[:12]
-    else:
-        display_cols = (key_cols + [c for c in column_names if c not in key_cols])[:10]
+    for c in column_names:
+        if c not in display_cols:
+            display_cols.append(c)
+    display_cols = display_cols[:15]
     return {
         "type": "table",
         "columns": display_cols,
@@ -250,6 +288,15 @@ def _keyword_search_structured(
         "total_matches": len(matches),
         "message": f"Found {len(matches)} matching row(s). Showing up to 50." if len(matches) > 50 else f"Found {len(matches)} matching row(s).",
     }
+
+
+def _get_openai_key() -> str | None:
+    """Return a valid API key (handles JLL GPT JWT expiry and optional refresh)."""
+    try:
+        from jll_gpt_token import get_effective_openai_key
+        return get_effective_openai_key()
+    except ImportError:
+        return os.environ.get("OPENAI_API_KEY", "").strip() or None
 
 
 def answer_with_openai(
@@ -267,9 +314,9 @@ def answer_with_openai(
             "Falling back to keyword search."
         )
 
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    api_key = _get_openai_key()
     if not api_key:
-        return "OPENAI_API_KEY not set. Using keyword search instead."
+        return "OPENAI_API_KEY not set or JLL GPT token expired. Update Secrets or configure token refresh. Using keyword search instead."
 
     client = openai.OpenAI(api_key=api_key)
     context = _rows_to_context(column_names, rows)
@@ -308,9 +355,9 @@ def answer_prompt(
     Answer a user question using sheet data.
     If use_llm and OPENAI_API_KEY is set, uses OpenAI; otherwise uses keyword search.
     """
-    if use_llm and os.environ.get("OPENAI_API_KEY", "").strip():
+    if use_llm and _get_openai_key():
         result = answer_with_openai(column_names, rows, question, sheet_name)
-        if "Falling back" not in result and "OPENAI_API_KEY not set" not in result:
+        if "Falling back" not in result and "OPENAI_API_KEY not set" not in result and "token expired" not in result:
             return result
     return _keyword_search(column_names, rows, question)
 
@@ -360,8 +407,8 @@ def answer_prompt_structured(
             }
         except Exception as e:
             return {"type": "text", "content": f"Could not run go-live-modified report: {e}. Try running the terminal report: python go_live_modified_report.py --days {days}."}
-    if use_llm and os.environ.get("OPENAI_API_KEY", "").strip():
+    if use_llm and _get_openai_key():
         text = answer_with_openai(column_names, rows, question, sheet_name)
-        if "Falling back" not in text and "OPENAI_API_KEY not set" not in text:
+        if "Falling back" not in text and "OPENAI_API_KEY not set" not in text and "token expired" not in text:
             return {"type": "text", "content": text}
     return _keyword_search_structured(column_names, rows, question)

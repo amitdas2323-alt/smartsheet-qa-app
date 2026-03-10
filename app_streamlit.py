@@ -22,7 +22,11 @@ import streamlit as st
 
 # Streamlit Community Cloud: inject Secrets into os.environ so smartsheet_client and prompt_on_data see them
 try:
-    for key in ("SMARTSHEET_ACCESS_TOKEN", "SMARTSHEET_SHEET_ID", "OPENAI_API_KEY", "OPENAI_MODEL"):
+    _secret_keys = (
+        "SMARTSHEET_ACCESS_TOKEN", "SMARTSHEET_SHEET_ID", "OPENAI_API_KEY", "OPENAI_MODEL",
+        "JLL_GPT_TOKEN_URL", "JLL_GPT_CLIENT_ID", "JLL_GPT_CLIENT_SECRET", "JLL_GPT_REFRESH_TOKEN",
+    )
+    for key in _secret_keys:
         if key in st.secrets and st.secrets[key]:
             os.environ[key] = str(st.secrets[key]).strip()
 except Exception:
