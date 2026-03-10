@@ -224,10 +224,19 @@ def _keyword_search(column_names: list[str], rows: list[dict[str, Any]], questio
     return "\n".join(lines)
 
 
+# Keywords that suggest a column holds a person/name/role (for "who" or "name" questions)
+_PERSON_COLUMN_KEYWORDS = (
+    "president", "director", "lead", "name", "owner", "contact", "email",
+    "divisional", "division", "assignee", "manager", "rep", "success",
+    "account director", "client success", "wdaa", "acct ",
+    " div ", " dp ", "dp/", "/dp", "div.", "divisional",
+)
+
+
 def _columns_relevant_to_question(column_names: list[str], question: str) -> list[str]:
     """
     Return columns whose names are suggested by the question (e.g. 'who is divisional president'
-    -> prefer column 'Divisional President'). Lets the table show the field that answers the question.
+    -> prefer column 'Divisional President'). For 'who' / name questions, also prefer person/role columns.
     """
     q = question.lower().strip()
     words = [w for w in re.split(r"[\s,?]+", q) if len(w) > 1]
@@ -237,6 +246,7 @@ def _columns_relevant_to_question(column_names: list[str], question: str) -> lis
             phrases.append(" ".join(words[i:j]))
     phrases = [p for p in phrases if len(p) > 2]
     relevant = []
+    # Match question phrases and words to column names (e.g. "divisional president" -> "Divisional President")
     for col in column_names:
         col_lower = col.lower()
         for p in phrases:
@@ -250,6 +260,14 @@ def _columns_relevant_to_question(column_names: list[str], question: str) -> lis
                     if col not in relevant:
                         relevant.append(col)
                     break
+    # When question asks "who" or for a name, add any column that looks like a person/role field
+    if "who" in q or "name" in q or "president" in q or "director" in q or "lead" in q:
+        for col in column_names:
+            col_lower = col.lower()
+            for kw in _PERSON_COLUMN_KEYWORDS:
+                if kw in col_lower and col not in relevant:
+                    relevant.append(col)
+                    break
     return relevant
 
 
@@ -262,7 +280,8 @@ def _keyword_search_structured(
         return {"type": "text", "content": "No matching rows found. Try different terms or check the summary."}
 
     # Question-relevant columns first (e.g. "Divisional President" for "who is divisional president"),
-    # then key cols, go-live when relevant, then rest. Cap at 15 so any field can be shown.
+    # then Account Name for context, then other key cols, go-live when relevant, then rest.
+    # Single-row results: show more columns (25) so the answer is almost always visible.
     key_cols = [c for c in column_names if c in ("Account Name", "Unique Product Acct ID", "Baseline: Overall Status", "Vertical", "Lead Region", "Deployment Type")][:6]
     question_cols = _columns_relevant_to_question(column_names, question)
     go_live_cols = [c for c in column_names if "go live" in c.lower() or "target go live" in c.lower()]
@@ -270,6 +289,9 @@ def _keyword_search_structured(
     for c in question_cols:
         if c not in display_cols:
             display_cols.append(c)
+    # Account Name early so user sees which account the answer refers to
+    if "Account Name" in column_names and "Account Name" not in display_cols:
+        display_cols.append("Account Name")
     for c in key_cols:
         if c not in display_cols:
             display_cols.append(c)
@@ -280,7 +302,8 @@ def _keyword_search_structured(
     for c in column_names:
         if c not in display_cols:
             display_cols.append(c)
-    display_cols = display_cols[:15]
+    max_cols = 25 if len(matches) == 1 else 15
+    display_cols = display_cols[:max_cols]
     return {
         "type": "table",
         "columns": display_cols,
