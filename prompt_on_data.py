@@ -53,24 +53,24 @@ def _rows_to_context(column_names: list[str], rows: list[dict[str, Any]], max_ch
 
 def _parse_go_live_month_year(question: str) -> tuple[int, int] | None:
     """
-    If the question asks for go live in a specific month/year (e.g. 'April 2026', 'expected to go live in March 2027'),
-    return (month, year). Else return None.
+    If the question asks for go live in a specific month/year (e.g. 'April 2026', 'go live in march'),
+    return (month, year). If only month is mentioned (e.g. 'march'), use current year. Else return None.
     """
     q = question.lower().strip()
-    if "go live" not in q and "golive" not in q:
+    if "go live" not in q and "golive" not in q and "target go live" not in q:
         return None
-    # Match "April 2026", "Apr 2026", "in April 2026", "April 2026 go live"
-    year_match = re.search(r"\b(20[2-4]\d)\b", q)  # 2020-2049
-    if not year_match:
-        return None
-    year = int(year_match.group(1))
+    # Explicit year in question: 2020-2049
+    year_match = re.search(r"\b(20[2-4]\d)\b", q)
+    if year_match:
+        year = int(year_match.group(1))
+    else:
+        year = datetime.now().year  # "march" without year → current year
     month = None
     for name, num in _MONTH_NAMES.items():
         if name in q:
             month = num
             break
     if month is None:
-        # Try "4/2026" or "04/2026"
         m = re.search(r"\b(1[0-2]|[1-9])\s*/\s*(20[2-4]\d)\b", q)
         if m:
             month = int(m.group(1))
@@ -181,25 +181,83 @@ def _try_go_live_month_filter(
     return (matches, True)
 
 
+def _try_combined_status_go_live_filter(
+    column_names: list[str], rows: list[dict[str, Any]], question: str
+) -> tuple[list[dict[str, Any]], bool] | None:
+    """
+    When the question asks for both a status (e.g. 'on track') AND go live in a month
+    (e.g. 'baseline target go live in march'), filter by both: status column = value AND go live target in that month.
+    Returns (matches, True) so UI shows only Account Name + Go Live Target.
+    """
+    q = question.lower().strip()
+    parsed = _parse_go_live_month_year(question)
+    if parsed is None:
+        return None
+    target_month, target_year = parsed
+    # Status: "on track" -> Baseline: Overall Status = On Track
+    status_col = None
+    status_value = None
+    if "on track" in q:
+        status_col = "Baseline: Overall Status"
+        status_value = "On Track"
+    if status_col not in column_names or status_value is None:
+        return None
+    go_live_col = None
+    for c in column_names:
+        cl = c.lower()
+        if "go live" in cl and ("target" in cl or "date" in cl) and "baseline" in cl:
+            go_live_col = c
+            break
+    if not go_live_col:
+        for c in column_names:
+            cl = c.lower()
+            if "go live" in cl and ("target" in cl or "date" in cl):
+                go_live_col = c
+                break
+    if not go_live_col:
+        return None
+    # First filter by status
+    status_matches = [
+        r for r in rows
+        if status_value.lower() in str(r.get(status_col, "") or "").lower()
+    ]
+    # Then filter by go live month/year
+    matches = []
+    for r in status_matches:
+        val = r.get(go_live_col)
+        cell_date = _parse_cell_date(val)
+        if cell_date is None:
+            continue
+        month, year = cell_date
+        if month == target_month and year == target_year:
+            matches.append(r)
+    return (matches, True)
+
+
 def _get_matching_rows(
     column_names: list[str], rows: list[dict[str, Any]], question: str
 ) -> tuple[list[dict[str, Any]], bool]:
     """
     Single source of truth for matching rows. Used by both CLI and web app.
-    Returns (matches, display_go_live). Order: 1) account name, 2) go live month/year, 3) column filters,
-    4) region, 5) assignee, 6) keyword search fallback.
+    Returns (matches, display_go_live). Order: 1) account name, 2) combined status+go_live month,
+    3) go live month only, 4) column filters, 5) region, 6) assignee, 7) keyword search fallback.
     """
     # 1) " for <account name>" e.g. "go live date for Amgen"
     account_result = _try_account_name_filter(column_names, rows, question)
     if account_result is not None:
         return account_result
 
-    # 2) "expected to go live in April 2026" -> filter by baseline go live target month/year
+    # 2) "on track ... go live in march" -> filter by status AND baseline go live month/year
+    combined_result = _try_combined_status_go_live_filter(column_names, rows, question)
+    if combined_result is not None:
+        return combined_result
+
+    # 3) "expected to go live in April 2026" -> filter by baseline go live target month/year only
     go_live_result = _try_go_live_month_filter(column_names, rows, question)
     if go_live_result is not None:
         return go_live_result
 
-    # 3) Column filters (Vertical, Baseline status, AI accounts)
+    # 4) Column filters (Vertical, Baseline status, AI accounts)
     matches = _try_column_filter(column_names, rows, question)
     if matches is not None:
         return (matches, False)
