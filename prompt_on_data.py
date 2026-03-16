@@ -84,6 +84,22 @@ def _parse_cell_date(value: Any) -> tuple[int, int] | None:
     """Parse a cell value as a date; return (month, year) or None."""
     if value is None:
         return None
+    # Smartsheet often returns dates as milliseconds since Unix epoch (number)
+    if isinstance(value, (int, float)):
+        n = float(value)
+        if n >= 1e12:  # milliseconds since epoch (e.g. 1773619200000 = Apr 2026)
+            try:
+                dt = datetime.utcfromtimestamp(n / 1000.0)
+                return (dt.month, dt.year)
+            except (OSError, ValueError):
+                pass
+        if n > 1000:  # Excel serial (days since 1900)
+            try:
+                d = datetime(1899, 12, 30) + timedelta(days=int(n))
+                return (d.month, d.year)
+            except (ValueError, TypeError):
+                pass
+        return None
     s = str(value).strip()
     if not s:
         return None
@@ -101,22 +117,31 @@ def _parse_cell_date(value: Any) -> tuple[int, int] | None:
             return (int(m.group(1)), int(m.group(3)))
         except ValueError:
             return None
-    # Excel serial (days since 1900-01-01): number
+    # Excel serial as string
     try:
         n = float(s)
-        if n > 1000:  # likely Excel serial
-            d = datetime(1899, 12, 30)  # Excel epoch
-            d = d + timedelta(days=int(n))
+        if n >= 1e12:
+            dt = datetime.utcfromtimestamp(n / 1000.0)
+            return (dt.month, dt.year)
+        if n > 1000:
+            d = datetime(1899, 12, 30) + timedelta(days=int(n))
             return (d.month, d.year)
     except (ValueError, TypeError):
         pass
-    # Try Python date parse for "April 15, 2026" etc.
-    for fmt in ("%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y", "%Y-%m-%d"):
+    # Text: "April 15, 2026", "15-Apr-2026", etc.
+    for fmt in ("%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y", "%Y-%m-%d", "%d-%b-%Y", "%d-%B-%Y"):
         try:
-            dt = datetime.strptime(s[:50], fmt)
+            dt = datetime.strptime(s[:50].strip(), fmt)
             return (dt.month, dt.year)
         except ValueError:
             continue
+    # Loose: any 4-digit year and month name/num
+    ym = re.search(r"(\d{1,2})[/\-](\d{4})", s) or re.search(r"(\d{4})[/\-](\d{1,2})", s)
+    if ym:
+        g = ym.groups()
+        if len(g[0]) == 4:  # year first
+            return (int(g[1]), int(g[0]))
+        return (int(g[0]), int(g[1]))
     return None
 
 
@@ -132,13 +157,16 @@ def _try_go_live_month_filter(
     if parsed is None:
         return None
     target_month, target_year = parsed
-    # Find go live target column (e.g. "Baseline Go Live Target", "Go Live Target")
+    # Find go live target column: prefer "Baseline Go Live Target", then any with "go live" + "target"/"date"
     go_live_col = None
     for c in column_names:
         cl = c.lower()
         if "go live" in cl and ("target" in cl or "date" in cl):
-            go_live_col = c
-            break
+            if "baseline" in cl:
+                go_live_col = c
+                break
+            if go_live_col is None:
+                go_live_col = c
     if not go_live_col:
         return None
     matches = []
@@ -395,6 +423,20 @@ def _columns_relevant_to_question(column_names: list[str], question: str) -> lis
     return relevant
 
 
+def _get_go_live_target_column(column_names: list[str]) -> str | None:
+    """Return the baseline go live target column name, or None."""
+    for c in column_names:
+        cl = c.lower()
+        if "go live" in cl and ("target" in cl or "date" in cl):
+            if "baseline" in cl:
+                return c
+    for c in column_names:
+        cl = c.lower()
+        if "go live" in cl and ("target" in cl or "date" in cl):
+            return c
+    return None
+
+
 def _keyword_search_structured(
     column_names: list[str], rows: list[dict[str, Any]], question: str
 ) -> dict[str, Any]:
@@ -403,31 +445,38 @@ def _keyword_search_structured(
     if not matches:
         return {"type": "text", "content": "No matching rows found. Try different terms or check the summary."}
 
-    # Question-relevant columns first (e.g. "Divisional President" for "who is divisional president"),
-    # then Account Name for context, then other key cols, go-live when relevant, then rest.
-    # Single-row results: show more columns (25) so the answer is almost always visible.
-    key_cols = [c for c in column_names if c in ("Account Name", "Unique Product Acct ID", "Baseline: Overall Status", "Vertical", "Lead Region", "Deployment Type")][:6]
-    question_cols = _columns_relevant_to_question(column_names, question)
-    go_live_cols = [c for c in column_names if "go live" in c.lower() or "target go live" in c.lower()]
-    display_cols = []
-    for c in question_cols:
-        if c not in display_cols:
-            display_cols.append(c)
-    # Account Name early so user sees which account the answer refers to
-    if "Account Name" in column_names and "Account Name" not in display_cols:
-        display_cols.append("Account Name")
-    for c in key_cols:
-        if c not in display_cols:
-            display_cols.append(c)
-    if display_go_live and go_live_cols:
-        for c in go_live_cols:
+    # "Go live in April 2026" type: show only Account Name and Go Live Target (two columns)
+    go_live_month_year = _parse_go_live_month_year(question)
+    go_live_target_col = _get_go_live_target_column(column_names)
+    if go_live_month_year is not None and go_live_target_col and display_go_live:
+        display_cols = []
+        if "Account Name" in column_names:
+            display_cols.append("Account Name")
+        if go_live_target_col not in display_cols:
+            display_cols.append(go_live_target_col)
+    else:
+        # Default: question-relevant first, then key cols, go-live, rest. Single-row: up to 25 cols.
+        key_cols = [c for c in column_names if c in ("Account Name", "Unique Product Acct ID", "Baseline: Overall Status", "Vertical", "Lead Region", "Deployment Type")][:6]
+        question_cols = _columns_relevant_to_question(column_names, question)
+        go_live_cols = [c for c in column_names if "go live" in c.lower() or "target go live" in c.lower()]
+        display_cols = []
+        for c in question_cols:
             if c not in display_cols:
                 display_cols.append(c)
-    for c in column_names:
-        if c not in display_cols:
-            display_cols.append(c)
-    max_cols = 25 if len(matches) == 1 else 15
-    display_cols = display_cols[:max_cols]
+        if "Account Name" in column_names and "Account Name" not in display_cols:
+            display_cols.append("Account Name")
+        for c in key_cols:
+            if c not in display_cols:
+                display_cols.append(c)
+        if display_go_live and go_live_cols:
+            for c in go_live_cols:
+                if c not in display_cols:
+                    display_cols.append(c)
+        for c in column_names:
+            if c not in display_cols:
+                display_cols.append(c)
+        max_cols = 25 if len(matches) == 1 else 15
+        display_cols = display_cols[:max_cols]
     return {
         "type": "table",
         "columns": display_cols,
