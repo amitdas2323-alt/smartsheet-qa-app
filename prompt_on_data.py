@@ -12,6 +12,7 @@ Shared logic (CLI and web app): _get_matching_rows() applies in order:
 
 import os
 import re
+from datetime import datetime, timedelta
 from typing import Any
 
 try:
@@ -19,6 +20,22 @@ try:
     load_dotenv()
 except ImportError:
     pass
+
+# Month name or abbreviation -> number (1-12)
+_MONTH_NAMES = {
+    "january": 1, "jan": 1,
+    "february": 2, "feb": 2,
+    "march": 3, "mar": 3,
+    "april": 4, "apr": 4,
+    "may": 5,
+    "june": 6, "jun": 6,
+    "july": 7, "jul": 7,
+    "august": 8, "aug": 8,
+    "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10,
+    "november": 11, "nov": 11,
+    "december": 12, "dec": 12,
+}
 
 
 def _rows_to_context(column_names: list[str], rows: list[dict[str, Any]], max_chars: int = 12000) -> str:
@@ -34,20 +51,127 @@ def _rows_to_context(column_names: list[str], rows: list[dict[str, Any]], max_ch
     return text
 
 
+def _parse_go_live_month_year(question: str) -> tuple[int, int] | None:
+    """
+    If the question asks for go live in a specific month/year (e.g. 'April 2026', 'expected to go live in March 2027'),
+    return (month, year). Else return None.
+    """
+    q = question.lower().strip()
+    if "go live" not in q and "golive" not in q:
+        return None
+    # Match "April 2026", "Apr 2026", "in April 2026", "April 2026 go live"
+    year_match = re.search(r"\b(20[2-4]\d)\b", q)  # 2020-2049
+    if not year_match:
+        return None
+    year = int(year_match.group(1))
+    month = None
+    for name, num in _MONTH_NAMES.items():
+        if name in q:
+            month = num
+            break
+    if month is None:
+        # Try "4/2026" or "04/2026"
+        m = re.search(r"\b(1[0-2]|[1-9])\s*/\s*(20[2-4]\d)\b", q)
+        if m:
+            month = int(m.group(1))
+            year = int(m.group(2))
+        else:
+            return None
+    return (month, year)
+
+
+def _parse_cell_date(value: Any) -> tuple[int, int] | None:
+    """Parse a cell value as a date; return (month, year) or None."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    # ISO: 2026-04-15 or 2026-04-15T00:00:00Z
+    m = re.match(r"(\d{4})-(\d{1,2})-(\d{1,2})", s)
+    if m:
+        try:
+            return (int(m.group(2)), int(m.group(1)))
+        except ValueError:
+            return None
+    # US format: 04/15/2026 or 4/15/2026
+    m = re.match(r"(\d{1,2})/(\d{1,2})/(\d{4})", s)
+    if m:
+        try:
+            return (int(m.group(1)), int(m.group(3)))
+        except ValueError:
+            return None
+    # Excel serial (days since 1900-01-01): number
+    try:
+        n = float(s)
+        if n > 1000:  # likely Excel serial
+            d = datetime(1899, 12, 30)  # Excel epoch
+            d = d + timedelta(days=int(n))
+            return (d.month, d.year)
+    except (ValueError, TypeError):
+        pass
+    # Try Python date parse for "April 15, 2026" etc.
+    for fmt in ("%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s[:50], fmt)
+            return (dt.month, dt.year)
+        except ValueError:
+            continue
+    return None
+
+
+def _try_go_live_month_filter(
+    column_names: list[str], rows: list[dict[str, Any]], question: str
+) -> tuple[list[dict[str, Any]], bool] | None:
+    """
+    If the question asks for accounts expected to go live in a specific month/year
+    (e.g. 'show me all accounts expected to go live in April 2026'), filter rows where
+    the baseline go live target date falls in that month/year.
+    """
+    parsed = _parse_go_live_month_year(question)
+    if parsed is None:
+        return None
+    target_month, target_year = parsed
+    # Find go live target column (e.g. "Baseline Go Live Target", "Go Live Target")
+    go_live_col = None
+    for c in column_names:
+        cl = c.lower()
+        if "go live" in cl and ("target" in cl or "date" in cl):
+            go_live_col = c
+            break
+    if not go_live_col:
+        return None
+    matches = []
+    for r in rows:
+        val = r.get(go_live_col)
+        cell_date = _parse_cell_date(val)
+        if cell_date is None:
+            continue
+        month, year = cell_date
+        if month == target_month and year == target_year:
+            matches.append(r)
+    return (matches, True)
+
+
 def _get_matching_rows(
     column_names: list[str], rows: list[dict[str, Any]], question: str
 ) -> tuple[list[dict[str, Any]], bool]:
     """
     Single source of truth for matching rows. Used by both CLI and web app.
-    Returns (matches, display_go_live). Order: 1) account name filter, 2) column filters,
-    3) assignee filter, 4) keyword search fallback.
+    Returns (matches, display_go_live). Order: 1) account name, 2) go live month/year, 3) column filters,
+    4) region, 5) assignee, 6) keyword search fallback.
     """
     # 1) " for <account name>" e.g. "go live date for Amgen"
     account_result = _try_account_name_filter(column_names, rows, question)
     if account_result is not None:
         return account_result
 
-    # 2) Column filters (Vertical, Baseline status, AI accounts)
+    # 2) "expected to go live in April 2026" -> filter by baseline go live target month/year
+    go_live_result = _try_go_live_month_filter(column_names, rows, question)
+    if go_live_result is not None:
+        return go_live_result
+
+    # 3) Column filters (Vertical, Baseline status, AI accounts)
     matches = _try_column_filter(column_names, rows, question)
     if matches is not None:
         return (matches, False)
