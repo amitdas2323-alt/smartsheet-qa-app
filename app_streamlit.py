@@ -33,7 +33,7 @@ except Exception:
     pass
 import pandas as pd
 from smartsheet_client import get_sheet, sheet_to_table, get_client_config
-from summary import build_executive_summary
+from summary import build_executive_summary, build_full_executive_summary
 from prompt_on_data import answer_prompt_structured
 
 
@@ -59,6 +59,21 @@ def main():
 
     st.caption(f"Sheet: **{sheet_name}** · {len(rows)} rows")
 
+    # Button to generate full executive summary (Azara-style report)
+    if st.button("Generate Executive Summary", type="primary"):
+        with st.spinner("Generating executive summary..."):
+            full_summary = build_full_executive_summary(column_names, rows, sheet_name=sheet_name)
+        st.session_state["full_executive_summary"] = full_summary
+        st.session_state["show_full_summary"] = True
+    if st.session_state.get("show_full_summary") and st.session_state.get("full_executive_summary"):
+        st.markdown("---")
+        st.markdown("### Executive Summary Report")
+        st.markdown(st.session_state["full_executive_summary"])
+        if st.button("Hide Executive Summary"):
+            st.session_state["show_full_summary"] = False
+            st.rerun()
+
+    st.markdown("---")
     question = st.text_input("Ask a question about the data", placeholder="e.g. How many accounts are on track?")
     if question:
         with st.spinner("Answering..."):
@@ -73,7 +88,7 @@ def main():
         else:
             st.markdown(result["content"])
 
-    with st.expander("Executive summary"):
+    with st.expander("Quick executive summary"):
         summary_text = build_executive_summary(column_names, rows, sheet_name=sheet_name)
         st.markdown(summary_text)
 
